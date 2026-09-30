@@ -9,26 +9,26 @@ import {
   calculateNetArbitrage
 } from "./fees.js";
 
+import {
+  getBTCOrderBooks,
+  simulateOrderBookArbitrage
+} from "./orderbooks.js";
+
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// ARBSCAN V2.1 — DEMO ONLY
+// ARBSCAN V2.2 — DEMO ONLY
 // ==========================================
 
 const CONFIG = Object.freeze({
   mode: "DEMO",
   realTradingEnabled: false,
-
   startingBalance: 10000,
   currency: "EUR",
-
-  // Montant utilisé pour chaque calcul DEMO.
   demoTradeAmount: 1000,
-
-  // Profit NET minimum exigé.
   minimumNetProfitPercent: 0.30
 });
 
@@ -36,7 +36,6 @@ const portfolio = {
   startingBalance: CONFIG.startingBalance,
   balance: CONFIG.startingBalance,
   totalProfit: 0,
-
   simulatedTrades: 0,
   winningTrades: 0,
   losingTrades: 0
@@ -44,17 +43,13 @@ const portfolio = {
 
 const trades = [];
 
-// ==========================================
-// SECURITY
-// ==========================================
-
 function assertDemoMode() {
   if (
     CONFIG.mode !== "DEMO" ||
     CONFIG.realTradingEnabled !== false
   ) {
     throw new Error(
-      "SECURITY LOCK: ArbScan V2 is DEMO ONLY."
+      "SECURITY LOCK: ArbScan is DEMO ONLY."
     );
   }
 }
@@ -66,26 +61,27 @@ function assertDemoMode() {
 app.get("/", (req, res) => {
   res.json({
     app: "ArbScan V2",
-    version: "0.2.1",
-
+    version: "0.2.2",
     status: "online",
-
     mode: CONFIG.mode,
     realTrading: false,
+    demoBalance: portfolio.balance,
+    currency: CONFIG.currency,
+    demoTradeAmount: CONFIG.demoTradeAmount,
 
-    demoBalance:
-      portfolio.balance,
-
-    currency:
-      CONFIG.currency,
-
-    demoTradeAmount:
-      CONFIG.demoTradeAmount,
+    features: {
+      livePrices: true,
+      estimatedFees: true,
+      orderBooks: true,
+      orderBookSlippage: true,
+      liveTrading: false
+    },
 
     endpoints: {
       status: "/api/status",
       portfolio: "/api/portfolio",
       btcScan: "/api/scan/btc",
+      btcOrderBookScan: "/api/scan/btc/orderbooks",
       trades: "/api/trades"
     }
   });
@@ -98,18 +94,12 @@ app.get("/", (req, res) => {
 app.get("/api/status", (req, res) => {
   res.json({
     status: "online",
-
-    version: "0.2.1",
-
-    mode:
-      CONFIG.mode,
-
+    version: "0.2.2",
+    mode: CONFIG.mode,
     realTradingEnabled:
       CONFIG.realTradingEnabled,
-
     demoTradeAmount:
       CONFIG.demoTradeAmount,
-
     minimumNetProfitPercent:
       CONFIG.minimumNetProfitPercent
   });
@@ -131,123 +121,270 @@ app.get("/api/portfolio", (req, res) => {
 
   res.json({
     ...portfolio,
-
     performancePercent:
-      Number(
-        performancePercent.toFixed(4)
-      ),
-
-    currency:
-      CONFIG.currency
+      Number(performancePercent.toFixed(4)),
+    currency: CONFIG.currency
   });
 });
 
 // ==========================================
-// TRADE HISTORY
+// TRADES
 // ==========================================
 
 app.get("/api/trades", (req, res) => {
   res.json({
-    count:
-      trades.length,
-
+    count: trades.length,
     trades
   });
 });
 
 // ==========================================
-// BTC/EUR LIVE MARKET SCAN
+// V2.1 — SIMPLE BTC SCAN
+// ==========================================
+
+app.get("/api/scan/btc", async (req, res) => {
+  try {
+    assertDemoMode();
+
+    const marketData =
+      await getBTCMarkets();
+
+    const bestOpportunity =
+      findBestBTCArbitrage(
+        marketData.markets
+      );
+
+    let netSimulation = null;
+
+    if (bestOpportunity) {
+      netSimulation =
+        calculateNetArbitrage({
+          buyExchange:
+            bestOpportunity.buyExchange,
+
+          sellExchange:
+            bestOpportunity.sellExchange,
+
+          buyPrice:
+            bestOpportunity.buyPrice,
+
+          sellPrice:
+            bestOpportunity.sellPrice,
+
+          amountEUR:
+            CONFIG.demoTradeAmount
+        });
+    }
+
+    const executeDemoTrade =
+      netSimulation &&
+      netSimulation.netProfitPercent >=
+        CONFIG.minimumNetProfitPercent;
+
+    res.json({
+      scanner: "ArbScan V2",
+      version: "0.2.2",
+      mode: "DEMO",
+      symbol: "BTC/EUR",
+      timestamp: new Date().toISOString(),
+
+      markets:
+        marketData.markets,
+
+      exchangeErrors:
+        marketData.errors,
+
+      bestGrossOpportunity:
+        bestOpportunity,
+
+      estimatedNetResult:
+        netSimulation,
+
+      decision: {
+        executeDemoTrade:
+          Boolean(executeDemoTrade),
+
+        reason:
+          executeDemoTrade
+            ? "Estimated net profit above DEMO threshold."
+            : "Estimated net profit below DEMO threshold."
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      scanner: "ArbScan V2",
+      mode: "DEMO",
+      error: error.message
+    });
+  }
+});
+
+// ==========================================
+// V2.2 — ORDER BOOK SCANNER
 // ==========================================
 
 app.get(
-  "/api/scan/btc",
+  "/api/scan/btc/orderbooks",
   async (req, res) => {
 
     try {
       assertDemoMode();
 
-      // -------------------------------
-      // 1. LIVE MARKET DATA
-      // -------------------------------
+      const orderBookData =
+        await getBTCOrderBooks();
 
-      const marketData =
-        await getBTCMarkets();
+      const books =
+        orderBookData.books;
 
-      // -------------------------------
-      // 2. BEST GROSS OPPORTUNITY
-      // -------------------------------
+      const routes = [];
 
-      const bestOpportunity =
-        findBestBTCArbitrage(
-          marketData.markets
-        );
+      // ====================================
+      // TEST EVERY EXCHANGE COMBINATION
+      // ====================================
 
-      let netSimulation = null;
+      for (const buyBook of books) {
 
-      let decision = {
-        executeDemoTrade: false,
-        reason:
-          "Not enough market data."
-      };
+        for (const sellBook of books) {
 
-      // -------------------------------
-      // 3. NET PROFIT SIMULATION
-      // -------------------------------
+          if (
+            buyBook.exchange ===
+            sellBook.exchange
+          ) {
+            continue;
+          }
 
-      if (bestOpportunity) {
+          const simulation =
+            simulateOrderBookArbitrage({
+              buyBook,
+              sellBook,
+              amountEUR:
+                CONFIG.demoTradeAmount
+            });
 
-        netSimulation =
-          calculateNetArbitrage({
+          if (!simulation.executable) {
+            routes.push({
+              buyExchange:
+                buyBook.exchange,
+
+              sellExchange:
+                sellBook.exchange,
+
+              executable: false,
+
+              simulation
+            });
+
+            continue;
+          }
+
+          // ==================================
+          // APPLY DEMO TRADING FEES
+          // ==================================
+
+          const feeResult =
+            calculateNetArbitrage({
+              buyExchange:
+                buyBook.exchange,
+
+              sellExchange:
+                sellBook.exchange,
+
+              buyPrice:
+                simulation.buy.averagePrice,
+
+              sellPrice:
+                simulation.sell.averagePrice,
+
+              amountEUR:
+                CONFIG.demoTradeAmount
+            });
+
+          routes.push({
             buyExchange:
-              bestOpportunity.buyExchange,
+              buyBook.exchange,
 
             sellExchange:
-              bestOpportunity.sellExchange,
+              sellBook.exchange,
 
-            buyPrice:
-              bestOpportunity.buyPrice,
+            executable: true,
 
-            sellPrice:
-              bestOpportunity.sellPrice,
+            orderBook: {
+              buyAveragePrice:
+                simulation.buy.averagePrice,
 
-            amountEUR:
-              CONFIG.demoTradeAmount
+              sellAveragePrice:
+                simulation.sell.averagePrice,
+
+              buyLevelsUsed:
+                simulation.buy.levelsUsed,
+
+              sellLevelsUsed:
+                simulation.sell.levelsUsed,
+
+              buySlippagePercent:
+                simulation.buy.slippagePercent,
+
+              sellSlippagePercent:
+                simulation.sell.slippagePercent
+            },
+
+            grossProfitEUR:
+              simulation.grossProfitEUR,
+
+            grossReturnPercent:
+              simulation.grossReturnPercent,
+
+            feesEUR:
+              feeResult.totalFeesEUR,
+
+            netProfitEUR:
+              feeResult.netProfitEUR,
+
+            netProfitPercent:
+              feeResult.netProfitPercent
           });
-
-        // -----------------------------
-        // 4. DECISION ENGINE
-        // -----------------------------
-
-        if (
-          netSimulation.netProfitPercent >=
-          CONFIG.minimumNetProfitPercent
-        ) {
-          decision = {
-            executeDemoTrade: true,
-
-            reason:
-              "Estimated net profit is above DEMO threshold."
-          };
-        } else {
-          decision = {
-            executeDemoTrade: false,
-
-            reason:
-              "Estimated net profit is below DEMO threshold."
-          };
         }
       }
 
-      // -------------------------------
-      // RESPONSE
-      // -------------------------------
+      // ====================================
+      // SORT BEST → WORST
+      // ====================================
+
+      const executableRoutes =
+        routes
+          .filter(route =>
+            route.executable &&
+            Number.isFinite(
+              route.netProfitPercent
+            )
+          )
+          .sort(
+            (a, b) =>
+              b.netProfitPercent -
+              a.netProfitPercent
+          );
+
+      const bestRoute =
+        executableRoutes[0] || null;
+
+      // ====================================
+      // DECISION
+      // ====================================
+
+      const executeDemoTrade =
+        Boolean(
+          bestRoute &&
+          bestRoute.netProfitPercent >=
+            CONFIG.minimumNetProfitPercent
+        );
 
       res.json({
         scanner:
           "ArbScan V2",
 
         version:
-          "0.2.1",
+          "0.2.2",
 
         mode:
           "DEMO",
@@ -261,28 +398,39 @@ app.get(
         demoTradeAmountEUR:
           CONFIG.demoTradeAmount,
 
-        exchangesAvailable:
-          marketData.markets.length,
-
-        markets:
-          marketData.markets,
+        orderBooksAvailable:
+          books.length,
 
         exchangeErrors:
-          marketData.errors,
+          orderBookData.errors,
 
-        bestGrossOpportunity:
-          bestOpportunity,
+        routesTested:
+          routes.length,
 
-        estimatedNetResult:
-          netSimulation,
+        routes,
 
-        decision,
+        bestRoute,
+
+        decision: {
+          executeDemoTrade,
+
+          minimumRequiredNetPercent:
+            CONFIG.minimumNetProfitPercent,
+
+          reason:
+            !bestRoute
+              ? "No executable route."
+              : executeDemoTrade
+                ? "Best route exceeds DEMO net-profit threshold."
+                : "No route exceeds DEMO net-profit threshold."
+        },
 
         limitations: [
           "Fee rates are DEMO assumptions.",
-          "Order-book depth is not yet included.",
-          "Slippage is not yet calculated from order books.",
-          "Transfer costs are not yet included.",
+          "Order books are snapshots and exchanges are queried separately.",
+          "Network latency can change prices before execution.",
+          "Transfer costs are not included.",
+          "Funds are not yet modeled as pre-positioned across exchanges.",
           "No real orders are executed."
         ]
       });
@@ -290,13 +438,16 @@ app.get(
     } catch (error) {
 
       console.error(
-        "BTC scanner error:",
+        "Order-book scanner error:",
         error
       );
 
       res.status(500).json({
         scanner:
           "ArbScan V2",
+
+        version:
+          "0.2.2",
 
         mode:
           "DEMO",
@@ -309,7 +460,7 @@ app.get(
 );
 
 // ==========================================
-// LIVE TRADING — HARD LOCK
+// LIVE TRADING HARD LOCK
 // ==========================================
 
 app.post(
@@ -318,12 +469,8 @@ app.post(
 
     res.status(403).json({
       executed: false,
-
-      mode:
-        "DEMO",
-
-      error:
-        "LIVE TRADING DISABLED"
+      mode: "DEMO",
+      error: "LIVE TRADING DISABLED"
     });
   }
 );
@@ -338,42 +485,26 @@ app.listen(
   () => {
 
     console.log("");
-    console.log(
-      "=============================="
-    );
-
-    console.log(
-      "       ARBSCAN V2.1"
-    );
-
-    console.log(
-      "=============================="
-    );
-
-    console.log(
-      "Mode: DEMO"
-    );
-
+    console.log("==============================");
+    console.log("       ARBSCAN V2.2");
+    console.log("==============================");
+    console.log("Mode: DEMO");
     console.log(
       `Demo balance: €${portfolio.balance}`
     );
-
     console.log(
       `Simulation amount: €${CONFIG.demoTradeAmount}`
     );
-
+    console.log(
+      "Order-book engine: ENABLED"
+    );
     console.log(
       "Real trading: DISABLED"
     );
-
     console.log(
       `Server port: ${PORT}`
     );
-
-    console.log(
-      "=============================="
-    );
-
+    console.log("==============================");
     console.log("");
   }
 );
