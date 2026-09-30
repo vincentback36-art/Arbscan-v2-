@@ -1,4 +1,8 @@
 import express from "express";
+import {
+  getBTCMarkets,
+  findBestBTCArbitrage
+} from "./exchanges.js";
 
 const app = express();
 app.use(express.json());
@@ -6,7 +10,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// ARBSCAN V2 — DEMO / PAPER TRADING ONLY
+// ARBSCAN V2 — DEMO ONLY
 // ==========================================
 
 const CONFIG = Object.freeze({
@@ -14,12 +18,7 @@ const CONFIG = Object.freeze({
   realTradingEnabled: false,
   startingBalance: 10000,
   currency: "EUR",
-
-  // On commencera uniquement si le profit NET
-  // dépasse ce seuil.
   minimumNetProfitPercent: 0.30,
-
-  // Capital maximum utilisé par une simulation.
   maxTradePercent: 10
 });
 
@@ -34,145 +33,42 @@ const portfolio = {
 
 const trades = [];
 
-// Sécurité absolue pour la V2 DEMO.
 function assertDemoMode() {
-  if (CONFIG.mode !== "DEMO" || CONFIG.realTradingEnabled !== false) {
+  if (
+    CONFIG.mode !== "DEMO" ||
+    CONFIG.realTradingEnabled !== false
+  ) {
     throw new Error(
-      "SECURITY LOCK: ArbScan V2 is restricted to DEMO trading."
+      "SECURITY LOCK: ArbScan V2 is DEMO ONLY."
     );
   }
 }
 
-// Calcule une opportunité d'arbitrage.
-// Les frais sont exprimés en pourcentage.
-function calculateOpportunity({
-  symbol,
-  buyExchange,
-  sellExchange,
-  buyPrice,
-  sellPrice,
-  buyFeePercent = 0,
-  sellFeePercent = 0,
-  slippagePercent = 0,
-  transferCost = 0,
-  amount = 1000
-}) {
-  const grossSpreadPercent =
-    ((sellPrice - buyPrice) / buyPrice) * 100;
-
-  const tradingFees =
-    amount * ((buyFeePercent + sellFeePercent) / 100);
-
-  const slippageCost =
-    amount * (slippagePercent / 100);
-
-  const grossProfit =
-    amount * (grossSpreadPercent / 100);
-
-  const netProfit =
-    grossProfit -
-    tradingFees -
-    slippageCost -
-    transferCost;
-
-  const netProfitPercent =
-    (netProfit / amount) * 100;
-
-  return {
-    symbol,
-    buyExchange,
-    sellExchange,
-    buyPrice,
-    sellPrice,
-    amount,
-
-    grossSpreadPercent:
-      Number(grossSpreadPercent.toFixed(4)),
-
-    estimatedCosts:
-      Number(
-        (
-          tradingFees +
-          slippageCost +
-          transferCost
-        ).toFixed(2)
-      ),
-
-    netProfit:
-      Number(netProfit.toFixed(2)),
-
-    netProfitPercent:
-      Number(netProfitPercent.toFixed(4)),
-
-    profitable:
-      netProfitPercent >=
-      CONFIG.minimumNetProfitPercent
-  };
-}
-
-// Simule un arbitrage.
-// Aucun ordre réel n'est envoyé.
-function executeDemoTrade(opportunity) {
-  assertDemoMode();
-
-  const maxAllowed =
-    portfolio.balance *
-    (CONFIG.maxTradePercent / 100);
-
-  if (opportunity.amount > maxAllowed) {
-    return {
-      executed: false,
-      reason: `Trade exceeds demo risk limit (€${maxAllowed.toFixed(2)})`
-    };
-  }
-
-  if (!opportunity.profitable) {
-    return {
-      executed: false,
-      reason: "Net profit below minimum threshold"
-    };
-  }
-
-  portfolio.balance += opportunity.netProfit;
-  portfolio.totalProfit += opportunity.netProfit;
-  portfolio.simulatedTrades += 1;
-
-  if (opportunity.netProfit >= 0) {
-    portfolio.winningTrades += 1;
-  } else {
-    portfolio.losingTrades += 1;
-  }
-
-  const trade = {
-    id: trades.length + 1,
-    type: "PAPER_TRADE",
-    timestamp: new Date().toISOString(),
-    ...opportunity
-  };
-
-  trades.unshift(trade);
-
-  return {
-    executed: true,
-    trade
-  };
-}
-
 // ==========================================
-// API
+// HOME
 // ==========================================
 
 app.get("/", (req, res) => {
   res.json({
     app: "ArbScan V2",
-    version: "0.1.0",
+    version: "0.2.0",
     status: "online",
     mode: CONFIG.mode,
     realTrading: false,
-    message:
-      "Arbitrage scanner running in DEMO mode."
+    demoBalance: portfolio.balance,
+    currency: CONFIG.currency,
+    endpoints: {
+      status: "/api/status",
+      portfolio: "/api/portfolio",
+      btcScan: "/api/scan/btc",
+      trades: "/api/trades"
+    }
   });
 });
+
+// ==========================================
+// STATUS
+// ==========================================
 
 app.get("/api/status", (req, res) => {
   res.json({
@@ -184,6 +80,10 @@ app.get("/api/status", (req, res) => {
       CONFIG.minimumNetProfitPercent
   });
 });
+
+// ==========================================
+// PORTFOLIO
+// ==========================================
 
 app.get("/api/portfolio", (req, res) => {
   const performancePercent =
@@ -200,6 +100,10 @@ app.get("/api/portfolio", (req, res) => {
   });
 });
 
+// ==========================================
+// TRADES
+// ==========================================
+
 app.get("/api/trades", (req, res) => {
   res.json({
     count: trades.length,
@@ -207,51 +111,99 @@ app.get("/api/trades", (req, res) => {
   });
 });
 
-// Route temporaire pour tester le moteur.
-// Plus tard, les prix seront fournis automatiquement
-// par les exchanges.
-app.post("/api/demo/opportunity", (req, res) => {
+// ==========================================
+// REAL MARKET SCAN — BTC/EUR
+// ==========================================
+//
+// IMPORTANT :
+// vrais prix publics,
+// mais AUCUN ordre réel.
+//
+// ==========================================
+
+app.get("/api/scan/btc", async (req, res) => {
   try {
     assertDemoMode();
 
-    const opportunity =
-      calculateOpportunity(req.body);
+    const marketData =
+      await getBTCMarkets();
 
-    const result =
-      executeDemoTrade(opportunity);
+    const bestOpportunity =
+      findBestBTCArbitrage(
+        marketData.markets
+      );
 
     res.json({
-      opportunity,
-      simulation: result,
-      portfolio
+      scanner: "ArbScan V2",
+      mode: "DEMO",
+
+      symbol: "BTC/EUR",
+
+      timestamp:
+        new Date().toISOString(),
+
+      exchangesAvailable:
+        marketData.markets.length,
+
+      markets:
+        marketData.markets,
+
+      errors:
+        marketData.errors,
+
+      bestOpportunity,
+
+      warning:
+        "Gross opportunity only. Trading fees, order-book depth and slippage are not yet included."
     });
+
   } catch (error) {
-    res.status(400).json({
+    console.error(
+      "BTC scanner error:",
+      error
+    );
+
+    res.status(500).json({
+      scanner: "ArbScan V2",
+      mode: "DEMO",
       error: error.message
     });
   }
 });
 
-// Toute tentative d'ordre réel est bloquée.
+// ==========================================
+// LIVE TRADING HARD LOCK
+// ==========================================
+
 app.post("/api/live/order", (req, res) => {
   res.status(403).json({
     executed: false,
+    mode: "DEMO",
     error:
-      "LIVE TRADING DISABLED — ArbScan V2 is currently DEMO ONLY."
+      "LIVE TRADING DISABLED"
   });
 });
 
-app.listen(PORT, () => {
+// ==========================================
+// SERVER
+// ==========================================
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
   console.log("       ARBSCAN V2");
   console.log("==============================");
-  console.log(`Mode: ${CONFIG.mode}`);
+  console.log("Version: 0.2.0");
+  console.log("Mode: DEMO");
   console.log(
     `Demo balance: €${portfolio.balance}`
   );
-  console.log("Real trading: DISABLED");
-  console.log(`Server port: ${PORT}`);
+  console.log(
+    "Real trading: DISABLED"
+  );
+  console.log(
+    `Server port: ${PORT}`
+  );
   console.log("==============================");
   console.log("");
 });
