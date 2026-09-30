@@ -1,2 +1,14 @@
 # Arbscan-v2-
-Ok 
+{
+  "name": "arbscan-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
