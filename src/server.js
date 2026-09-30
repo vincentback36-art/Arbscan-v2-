@@ -1,227 +1,361 @@
 import express from "express";
 
 import {
-  getBTCMarkets,
-  findBestBTCArbitrage
-} from "./exchanges.js";
-
-import {
-  calculateNetArbitrage
-} from "./fees.js";
+  CONFIG,
+  assertDemoMode,
+  getTakerFee,
+  validateConfig
+} from "./config.js";
 
 import {
   getBTCOrderBooks,
   simulateOrderBookArbitrage
 } from "./orderbooks.js";
 
+import {
+  initializePortfolio,
+  getPortfolio,
+  getPortfolioValue,
+  canExecuteArbitrage,
+  getTradeHistory
+} from "./portfolio.js";
+
 const app = express();
+
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT =
+  process.env.PORT || 3000;
+
 
 // ==========================================
-// ARBSCAN V2.2 — DEMO ONLY
+// ARBSCAN V2.3
+// PAPER TRADING / DEMO ONLY
 // ==========================================
 
-const CONFIG = Object.freeze({
-  mode: "DEMO",
-  realTradingEnabled: false,
-  startingBalance: 10000,
-  currency: "EUR",
-  demoTradeAmount: 1000,
-  minimumNetProfitPercent: 0.30
-});
+validateConfig();
+assertDemoMode();
 
-const portfolio = {
-  startingBalance: CONFIG.startingBalance,
-  balance: CONFIG.startingBalance,
-  totalProfit: 0,
-  simulatedTrades: 0,
-  winningTrades: 0,
-  losingTrades: 0
-};
 
-const trades = [];
+// ==========================================
+// HELPERS
+// ==========================================
 
-function assertDemoMode() {
-  if (
-    CONFIG.mode !== "DEMO" ||
-    CONFIG.realTradingEnabled !== false
-  ) {
+function getReferenceBTCPrice(books) {
+
+  const prices = [];
+
+  for (const book of books) {
+
+    const bestBid =
+      book.bids?.[0]?.price;
+
+    const bestAsk =
+      book.asks?.[0]?.price;
+
+    if (
+      Number.isFinite(bestBid) &&
+      Number.isFinite(bestAsk)
+    ) {
+
+      prices.push(
+        (bestBid + bestAsk) / 2
+      );
+    }
+  }
+
+  if (prices.length === 0) {
     throw new Error(
-      "SECURITY LOCK: ArbScan is DEMO ONLY."
+      "Unable to calculate BTC reference price."
     );
   }
+
+  return (
+    prices.reduce(
+      (sum, price) =>
+        sum + price,
+      0
+    ) /
+    prices.length
+  );
 }
+
+
+function calculateRouteFees({
+  buyExchange,
+  sellExchange,
+  buyCostEUR,
+  sellRevenueEUR
+}) {
+
+  const buyFeePercent =
+    getTakerFee(
+      buyExchange
+    );
+
+  const sellFeePercent =
+    getTakerFee(
+      sellExchange
+    );
+
+  const buyFeeEUR =
+    buyCostEUR *
+    (
+      buyFeePercent /
+      100
+    );
+
+  const sellFeeEUR =
+    sellRevenueEUR *
+    (
+      sellFeePercent /
+      100
+    );
+
+  return {
+
+    buyFeePercent,
+
+    sellFeePercent,
+
+    buyFeeEUR:
+      Number(
+        buyFeeEUR.toFixed(4)
+      ),
+
+    sellFeeEUR:
+      Number(
+        sellFeeEUR.toFixed(4)
+      ),
+
+    totalFeesEUR:
+      Number(
+        (
+          buyFeeEUR +
+          sellFeeEUR
+        ).toFixed(4)
+      )
+  };
+}
+
 
 // ==========================================
 // HOME
 // ==========================================
 
 app.get("/", (req, res) => {
+
   res.json({
-    app: "ArbScan V2",
-    version: "0.2.2",
-    status: "online",
-    mode: CONFIG.mode,
-    realTrading: false,
-    demoBalance: portfolio.balance,
-    currency: CONFIG.currency,
-    demoTradeAmount: CONFIG.demoTradeAmount,
+
+    app:
+      "ArbScan V2",
+
+    version:
+      "0.2.3",
+
+    status:
+      "online",
+
+    mode:
+      CONFIG.mode,
+
+    realTrading:
+      false,
+
+    startingBalanceEUR:
+      CONFIG.startingBalanceEUR,
+
+    demoTradeAmountEUR:
+      CONFIG.demoTradeAmountEUR,
+
+    minimumNetProfitPercent:
+      CONFIG.minimumNetProfitPercent,
 
     features: {
-      livePrices: true,
-      estimatedFees: true,
-      orderBooks: true,
-      orderBookSlippage: true,
-      liveTrading: false
+
+      livePrices:
+        true,
+
+      liveOrderBooks:
+        true,
+
+      orderBookSlippage:
+        true,
+
+      configurableFees:
+        true,
+
+      prePositionedBalances:
+        true,
+
+      paperPortfolio:
+        true,
+
+      automaticPaperTrading:
+        false,
+
+      liveTrading:
+        false
     },
 
     endpoints: {
-      status: "/api/status",
-      portfolio: "/api/portfolio",
-      btcScan: "/api/scan/btc",
-      btcOrderBookScan: "/api/scan/btc/orderbooks",
-      trades: "/api/trades"
+
+      status:
+        "/api/status",
+
+      scan:
+        "/api/scan/btc/orderbooks",
+
+      portfolio:
+        "/api/portfolio",
+
+      trades:
+        "/api/trades"
     }
   });
 });
+
 
 // ==========================================
 // STATUS
 // ==========================================
 
-app.get("/api/status", (req, res) => {
-  res.json({
-    status: "online",
-    version: "0.2.2",
-    mode: CONFIG.mode,
-    realTradingEnabled:
-      CONFIG.realTradingEnabled,
-    demoTradeAmount:
-      CONFIG.demoTradeAmount,
-    minimumNetProfitPercent:
-      CONFIG.minimumNetProfitPercent
-  });
-});
+app.get(
+  "/api/status",
+  (req, res) => {
+
+    res.json({
+
+      status:
+        "online",
+
+      version:
+        "0.2.3",
+
+      mode:
+        CONFIG.mode,
+
+      realTradingEnabled:
+        CONFIG.realTradingEnabled,
+
+      automaticPaperTrading:
+        false,
+
+      demoTradeAmountEUR:
+        CONFIG.demoTradeAmountEUR,
+
+      minimumNetProfitPercent:
+        CONFIG.minimumNetProfitPercent,
+
+      fees:
+        CONFIG.fees,
+
+      risk:
+        CONFIG.risk
+    });
+  }
+);
+
 
 // ==========================================
 // PORTFOLIO
 // ==========================================
 
-app.get("/api/portfolio", (req, res) => {
-  const performancePercent =
-    (
-      (
-        portfolio.balance -
-        portfolio.startingBalance
-      ) /
-      portfolio.startingBalance
-    ) * 100;
+app.get(
+  "/api/portfolio",
+  async (req, res) => {
 
-  res.json({
-    ...portfolio,
-    performancePercent:
-      Number(performancePercent.toFixed(4)),
-    currency: CONFIG.currency
-  });
-});
+    try {
 
-// ==========================================
-// TRADES
-// ==========================================
+      assertDemoMode();
 
-app.get("/api/trades", (req, res) => {
-  res.json({
-    count: trades.length,
-    trades
-  });
-});
+      const orderBookData =
+        await getBTCOrderBooks();
 
-// ==========================================
-// V2.1 — SIMPLE BTC SCAN
-// ==========================================
+      if (
+        orderBookData.books.length === 0
+      ) {
+        throw new Error(
+          "No order books available."
+        );
+      }
 
-app.get("/api/scan/btc", async (req, res) => {
-  try {
-    assertDemoMode();
+      const btcReferencePrice =
+        getReferenceBTCPrice(
+          orderBookData.books
+        );
 
-    const marketData =
-      await getBTCMarkets();
-
-    const bestOpportunity =
-      findBestBTCArbitrage(
-        marketData.markets
+      initializePortfolio(
+        btcReferencePrice
       );
 
-    let netSimulation = null;
+      const portfolio =
+        getPortfolioValue(
+          btcReferencePrice
+        );
 
-    if (bestOpportunity) {
-      netSimulation =
-        calculateNetArbitrage({
-          buyExchange:
-            bestOpportunity.buyExchange,
+      res.json({
 
-          sellExchange:
-            bestOpportunity.sellExchange,
+        mode:
+          "DEMO",
 
-          buyPrice:
-            bestOpportunity.buyPrice,
+        version:
+          "0.2.3",
 
-          sellPrice:
-            bestOpportunity.sellPrice,
+        btcReferencePriceEUR:
+          Number(
+            btcReferencePrice.toFixed(2)
+          ),
 
-          amountEUR:
-            CONFIG.demoTradeAmount
-        });
+        portfolio,
+
+        tradeHistoryCount:
+          getTradeHistory().length
+      });
+
+    } catch (error) {
+
+      res.status(500).json({
+
+        mode:
+          "DEMO",
+
+        error:
+          error.message
+      });
     }
-
-    const executeDemoTrade =
-      netSimulation &&
-      netSimulation.netProfitPercent >=
-        CONFIG.minimumNetProfitPercent;
-
-    res.json({
-      scanner: "ArbScan V2",
-      version: "0.2.2",
-      mode: "DEMO",
-      symbol: "BTC/EUR",
-      timestamp: new Date().toISOString(),
-
-      markets:
-        marketData.markets,
-
-      exchangeErrors:
-        marketData.errors,
-
-      bestGrossOpportunity:
-        bestOpportunity,
-
-      estimatedNetResult:
-        netSimulation,
-
-      decision: {
-        executeDemoTrade:
-          Boolean(executeDemoTrade),
-
-        reason:
-          executeDemoTrade
-            ? "Estimated net profit above DEMO threshold."
-            : "Estimated net profit below DEMO threshold."
-      }
-    });
-
-  } catch (error) {
-    res.status(500).json({
-      scanner: "ArbScan V2",
-      mode: "DEMO",
-      error: error.message
-    });
   }
-});
+);
+
 
 // ==========================================
-// V2.2 — ORDER BOOK SCANNER
+// TRADE HISTORY
+// ==========================================
+
+app.get(
+  "/api/trades",
+  (req, res) => {
+
+    res.json({
+
+      mode:
+        "DEMO",
+
+      automaticTrading:
+        false,
+
+      count:
+        getTradeHistory().length,
+
+      trades:
+        getTradeHistory()
+    });
+  }
+);
+
+
+// ==========================================
+// BTC ORDER BOOK SCANNER
 // ==========================================
 
 app.get(
@@ -229,7 +363,12 @@ app.get(
   async (req, res) => {
 
     try {
+
       assertDemoMode();
+
+      // ------------------------------------
+      // FETCH LIVE BOOKS
+      // ------------------------------------
 
       const orderBookData =
         await getBTCOrderBooks();
@@ -237,15 +376,43 @@ app.get(
       const books =
         orderBookData.books;
 
+      if (books.length < 2) {
+
+        throw new Error(
+          "At least two order books are required."
+        );
+      }
+
+      // ------------------------------------
+      // BTC REFERENCE PRICE
+      // ------------------------------------
+
+      const btcReferencePrice =
+        getReferenceBTCPrice(
+          books
+        );
+
+      // ------------------------------------
+      // INITIALIZE PAPER PORTFOLIO
+      // ------------------------------------
+
+      initializePortfolio(
+        btcReferencePrice
+      );
+
+      // ------------------------------------
+      // TEST ALL ROUTES
+      // ------------------------------------
+
       const routes = [];
 
-      // ====================================
-      // TEST EVERY EXCHANGE COMBINATION
-      // ====================================
+      for (
+        const buyBook of books
+      ) {
 
-      for (const buyBook of books) {
-
-        for (const sellBook of books) {
+        for (
+          const sellBook of books
+        ) {
 
           if (
             buyBook.exchange ===
@@ -256,21 +423,37 @@ app.get(
 
           const simulation =
             simulateOrderBookArbitrage({
+
               buyBook,
+
               sellBook,
+
               amountEUR:
-                CONFIG.demoTradeAmount
+                CONFIG.demoTradeAmountEUR
             });
 
-          if (!simulation.executable) {
+
+          // --------------------------------
+          // LIQUIDITY FAILURE
+          // --------------------------------
+
+          if (
+            !simulation.executable
+          ) {
+
             routes.push({
+
               buyExchange:
                 buyBook.exchange,
 
               sellExchange:
                 sellBook.exchange,
 
-              executable: false,
+              executable:
+                false,
+
+              reason:
+                "Insufficient order-book liquidity.",
 
               simulation
             });
@@ -278,74 +461,184 @@ app.get(
             continue;
           }
 
-          // ==================================
-          // APPLY DEMO TRADING FEES
-          // ==================================
 
-          const feeResult =
-            calculateNetArbitrage({
+          // --------------------------------
+          // FEES
+          // --------------------------------
+
+          const fees =
+            calculateRouteFees({
+
               buyExchange:
                 buyBook.exchange,
 
               sellExchange:
                 sellBook.exchange,
 
-              buyPrice:
-                simulation.buy.averagePrice,
+              buyCostEUR:
+                simulation.buy.eurSpent,
 
-              sellPrice:
-                simulation.sell.averagePrice,
-
-              amountEUR:
-                CONFIG.demoTradeAmount
+              sellRevenueEUR:
+                simulation.sell.eurReceived
             });
 
+
+          // --------------------------------
+          // NET PROFIT
+          // --------------------------------
+
+          const netProfitEUR =
+            simulation.sell.eurReceived -
+            fees.sellFeeEUR -
+            simulation.buy.eurSpent -
+            fees.buyFeeEUR;
+
+          const netProfitPercent =
+            (
+              netProfitEUR /
+              simulation.buy.eurSpent
+            ) * 100;
+
+
+          // --------------------------------
+          // SLIPPAGE CHECK
+          // --------------------------------
+
+          const buySlippage =
+            simulation.buy
+              .slippagePercent;
+
+          const sellSlippage =
+            simulation.sell
+              .slippagePercent;
+
+          const slippageAllowed =
+            buySlippage <=
+              CONFIG.risk
+                .maxSlippagePercent &&
+            sellSlippage <=
+              CONFIG.risk
+                .maxSlippagePercent;
+
+
+          // --------------------------------
+          // BALANCE CHECK
+          // --------------------------------
+
+          const balanceCheck =
+            canExecuteArbitrage({
+
+              buyExchange:
+                buyBook.exchange,
+
+              sellExchange:
+                sellBook.exchange,
+
+              amountEUR:
+                simulation.buy.eurSpent +
+                fees.buyFeeEUR,
+
+              btcAmount:
+                simulation.buy.btcAmount
+            });
+
+
+          // --------------------------------
+          // PROFIT CHECK
+          // --------------------------------
+
+          const profitableEnough =
+            netProfitPercent >=
+            CONFIG
+              .minimumNetProfitPercent;
+
+
+          // --------------------------------
+          // FINAL ROUTE ELIGIBILITY
+          // --------------------------------
+
+          const paperTradeEligible =
+            balanceCheck.allowed &&
+            slippageAllowed &&
+            profitableEnough;
+
+
           routes.push({
+
             buyExchange:
               buyBook.exchange,
 
             sellExchange:
               sellBook.exchange,
 
-            executable: true,
+            executable:
+              true,
 
             orderBook: {
+
               buyAveragePrice:
-                simulation.buy.averagePrice,
+                simulation.buy
+                  .averagePrice,
 
               sellAveragePrice:
-                simulation.sell.averagePrice,
+                simulation.sell
+                  .averagePrice,
 
               buyLevelsUsed:
-                simulation.buy.levelsUsed,
+                simulation.buy
+                  .levelsUsed,
 
               sellLevelsUsed:
-                simulation.sell.levelsUsed,
+                simulation.sell
+                  .levelsUsed,
 
               buySlippagePercent:
-                simulation.buy.slippagePercent,
+                buySlippage,
 
               sellSlippagePercent:
-                simulation.sell.slippagePercent
+                sellSlippage
             },
 
             grossProfitEUR:
-              simulation.grossProfitEUR,
+              simulation
+                .grossProfitEUR,
 
             grossReturnPercent:
-              simulation.grossReturnPercent,
+              simulation
+                .grossReturnPercent,
 
-            feesEUR:
-              feeResult.totalFeesEUR,
+            fees,
 
             netProfitEUR:
-              feeResult.netProfitEUR,
+              Number(
+                netProfitEUR.toFixed(4)
+              ),
 
             netProfitPercent:
-              feeResult.netProfitPercent
+              Number(
+                netProfitPercent.toFixed(6)
+              ),
+
+            checks: {
+
+              sufficientBalances:
+                balanceCheck.allowed,
+
+              balanceCheck,
+
+              slippageAllowed,
+
+              profitableEnough
+            },
+
+            paperTradeEligible,
+
+            paperTradeExecuted:
+              false
           });
         }
       }
+
 
       // ====================================
       // SORT BEST → WORST
@@ -353,11 +646,12 @@ app.get(
 
       const executableRoutes =
         routes
-          .filter(route =>
-            route.executable &&
-            Number.isFinite(
-              route.netProfitPercent
-            )
+          .filter(
+            route =>
+              route.executable &&
+              Number.isFinite(
+                route.netProfitPercent
+              )
           )
           .sort(
             (a, b) =>
@@ -365,26 +659,40 @@ app.get(
               a.netProfitPercent
           );
 
+
       const bestRoute =
-        executableRoutes[0] || null;
+        executableRoutes[0] ||
+        null;
+
+
+      const bestEligibleRoute =
+        executableRoutes.find(
+          route =>
+            route.paperTradeEligible
+        ) || null;
+
 
       // ====================================
-      // DECISION
+      // PORTFOLIO VALUATION
       // ====================================
 
-      const executeDemoTrade =
-        Boolean(
-          bestRoute &&
-          bestRoute.netProfitPercent >=
-            CONFIG.minimumNetProfitPercent
+      const portfolio =
+        getPortfolioValue(
+          btcReferencePrice
         );
 
+
+      // ====================================
+      // RESPONSE
+      // ====================================
+
       res.json({
+
         scanner:
           "ArbScan V2",
 
         version:
-          "0.2.2",
+          "0.2.3",
 
         mode:
           "DEMO",
@@ -395,8 +703,16 @@ app.get(
         timestamp:
           new Date().toISOString(),
 
+        btcReferencePriceEUR:
+          Number(
+            btcReferencePrice.toFixed(2)
+          ),
+
         demoTradeAmountEUR:
-          CONFIG.demoTradeAmount,
+          CONFIG.demoTradeAmountEUR,
+
+        minimumNetProfitPercent:
+          CONFIG.minimumNetProfitPercent,
 
         orderBooksAvailable:
           books.length,
@@ -411,43 +727,56 @@ app.get(
 
         bestRoute,
 
-        decision: {
-          executeDemoTrade,
+        bestEligibleRoute,
 
-          minimumRequiredNetPercent:
-            CONFIG.minimumNetProfitPercent,
+        decision: {
+
+          paperTradeWouldExecute:
+            Boolean(
+              bestEligibleRoute
+            ),
+
+          paperTradeActuallyExecuted:
+            false,
 
           reason:
-            !bestRoute
-              ? "No executable route."
-              : executeDemoTrade
-                ? "Best route exceeds DEMO net-profit threshold."
-                : "No route exceeds DEMO net-profit threshold."
+            bestEligibleRoute
+              ? "Eligible paper-trade opportunity detected, but automatic execution is disabled in V2.3."
+              : "No route currently satisfies all V2.3 conditions."
         },
 
+        portfolio,
+
         limitations: [
-          "Fee rates are DEMO assumptions.",
-          "Order books are snapshots and exchanges are queried separately.",
-          "Network latency can change prices before execution.",
-          "Transfer costs are not included.",
-          "Funds are not yet modeled as pre-positioned across exchanges.",
-          "No real orders are executed."
+
+          "Automatic paper trading is disabled.",
+
+          "No real orders are executed.",
+
+          "Order books are snapshots fetched separately.",
+
+          "Network latency may change executable prices.",
+
+          "Exchange fee tiers may vary by account and trading volume.",
+
+          "Rebalancing costs are not yet modeled."
         ]
       });
 
     } catch (error) {
 
       console.error(
-        "Order-book scanner error:",
+        "V2.3 scanner error:",
         error
       );
 
       res.status(500).json({
+
         scanner:
           "ArbScan V2",
 
         version:
-          "0.2.2",
+          "0.2.3",
 
         mode:
           "DEMO",
@@ -459,8 +788,9 @@ app.get(
   }
 );
 
+
 // ==========================================
-// LIVE TRADING HARD LOCK
+// REAL TRADING — HARD LOCK
 // ==========================================
 
 app.post(
@@ -468,12 +798,19 @@ app.post(
   (req, res) => {
 
     res.status(403).json({
-      executed: false,
-      mode: "DEMO",
-      error: "LIVE TRADING DISABLED"
+
+      executed:
+        false,
+
+      mode:
+        "DEMO",
+
+      error:
+        "LIVE TRADING DISABLED"
     });
   }
 );
+
 
 // ==========================================
 // SERVER
@@ -485,26 +822,50 @@ app.listen(
   () => {
 
     console.log("");
-    console.log("==============================");
-    console.log("       ARBSCAN V2.2");
-    console.log("==============================");
-    console.log("Mode: DEMO");
     console.log(
-      `Demo balance: €${portfolio.balance}`
+      "=============================="
     );
+
     console.log(
-      `Simulation amount: €${CONFIG.demoTradeAmount}`
+      "       ARBSCAN V2.3"
     );
+
     console.log(
-      "Order-book engine: ENABLED"
+      "=============================="
     );
+
+    console.log(
+      "Mode: DEMO"
+    );
+
+    console.log(
+      `Starting capital: €${CONFIG.startingBalanceEUR}`
+    );
+
+    console.log(
+      `Max simulated trade: €${CONFIG.demoTradeAmountEUR}`
+    );
+
+    console.log(
+      "Pre-positioned balances: ENABLED"
+    );
+
+    console.log(
+      "Automatic paper trading: DISABLED"
+    );
+
     console.log(
       "Real trading: DISABLED"
     );
+
     console.log(
       `Server port: ${PORT}`
     );
-    console.log("==============================");
+
+    console.log(
+      "=============================="
+    );
+
     console.log("");
   }
 );
